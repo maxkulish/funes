@@ -112,6 +112,28 @@ A no-path refresh is **budgeted and text-first**: it does a fast text pass and o
 deeper content, so a large backlog fills in a bounded step at a time rather than one long stall. An
 explicit path or Hub repo is indexed in full.
 
+## Keeping the indexes current
+
+Recall searches through two indexes over the memory: BM25 on the text and IVF_PQ on the vectors. A
+run that wrote nothing leaves them alone. A run that wrote rows adds them to each index as a
+**delta**, a small sub-index built with the model the index was trained with, so the per-turn hook
+pays for the rows it added, not for the whole memory. Once 8 deltas pile up, they are merged into
+one, and the base index is not read.
+
+A **full rebuild** retrains both indexes over every row, and it happens only when:
+
+- an index is missing: on the first index, and while the memory is too small to train the vector
+  index (lance needs about 256 rows);
+- the memory holds **twice the rows** the indexes were trained over. The vector index sizes its
+  partitions from the row count at training and a delta reuses them, so by then each partition holds
+  twice its target and a query reads twice the rows it should. Doubling keeps the rebuild work over a
+  memory's life within twice its final size;
+- a delta fails to build.
+
+On a memory of a million chunks a rebuild takes minutes, and it holds the memory lock the whole
+time. Rows not yet in an index are still found: recall scans them directly, next to the index, so
+an index that lags is only slower, never missing rows.
+
 ## Tiers and ordering
 
 Blocks are indexed in three tiers, cheapest-and-highest-value first:

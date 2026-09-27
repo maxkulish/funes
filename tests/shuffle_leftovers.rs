@@ -1,4 +1,4 @@
-//! The tripwire for the file names `build_indexes`'s sweep matches on, which are lance's to change.
+//! The tripwire for the file names the index sweep matches on, which are lance's to change.
 //! Its own test binary so its `$TMPDIR` can't race another integration test's.
 
 use std::collections::BTreeSet;
@@ -21,7 +21,7 @@ const SHUFFLE_FILES: [&str; 4] = [
 ];
 
 #[test]
-fn a_settled_shuffle_dir_is_reclaimed_by_the_next_build() {
+fn a_settled_shuffle_dir_is_reclaimed_by_the_next_build_or_delta() {
     let tmp = tempfile::tempdir().unwrap();
     // Before the runtime exists, so no other thread can be reading the environment.
     std::env::set_var("TMPDIR", tmp.path());
@@ -34,29 +34,39 @@ fn a_settled_shuffle_dir_is_reclaimed_by_the_next_build() {
         // Outside the `.tmp*` namespace, so the dataset never reads as a leftover.
         let mut ds = write_dataset(&tmp.path().join("memory.lance")).await;
 
-        let before = tmp_dirs(tmp.path());
-        funes::memory::dataset::build_indexes(&mut ds, |_| {}).await;
-        let leaked: Vec<PathBuf> = tmp_dirs(tmp.path())
-            .difference(&before)
-            .filter(|d| holds_only_shuffle_files(d))
-            .cloned()
-            .collect();
-        assert!(
-            !leaked.is_empty(),
-            "a build left no directory holding {SHUFFLE_FILES:?} — if lance stopped leaking, or \
-             renamed these files, the sweep is matching on nothing"
-        );
-
-        // Age them past the sweep's threshold, as a leftover from an earlier run would be.
-        for dir in &leaked {
-            let settled = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
-            std::fs::File::open(dir).unwrap().set_modified(settled).unwrap();
-        }
-
+        let leaked = settled_leftovers(tmp.path(), &mut ds).await;
         funes::memory::dataset::build_indexes(&mut ds, |_| {}).await;
         let kept: Vec<&PathBuf> = leaked.iter().filter(|d| d.exists()).collect();
         assert!(kept.is_empty(), "the next build left {kept:?} behind");
+
+        // An update that only appends a delta must sweep too, or leftovers wait for the next retrain.
+        let leaked = settled_leftovers(tmp.path(), &mut ds).await;
+        funes::memory::dataset::refresh_indexes(&mut ds, |_| {}).await;
+        let kept: Vec<&PathBuf> = leaked.iter().filter(|d| d.exists()).collect();
+        assert!(kept.is_empty(), "the next delta update left {kept:?} behind");
     });
+}
+
+/// Build the indexes, then age the shuffle directories that build leaked past the sweep's
+/// threshold, as a leftover from an earlier run would be.
+async fn settled_leftovers(tmp: &Path, ds: &mut Dataset) -> Vec<PathBuf> {
+    let before = tmp_dirs(tmp);
+    funes::memory::dataset::build_indexes(ds, |_| {}).await;
+    let leaked: Vec<PathBuf> = tmp_dirs(tmp)
+        .difference(&before)
+        .filter(|d| holds_only_shuffle_files(d))
+        .cloned()
+        .collect();
+    assert!(
+        !leaked.is_empty(),
+        "a build left no directory holding {SHUFFLE_FILES:?} — if lance stopped leaking, or \
+         renamed these files, the sweep is matching on nothing"
+    );
+    for dir in &leaked {
+        let settled = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::open(dir).unwrap().set_modified(settled).unwrap();
+    }
+    leaked
 }
 
 /// The `.tmp*` directories directly under `root` — tempfile's prefix, and so lance's.

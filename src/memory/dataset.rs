@@ -159,6 +159,7 @@ pub async fn refresh_indexes(ds: &mut Dataset, on_phase: impl Fn(&str)) {
     if !has_every_index(ds).await || outgrew_indexes(ds).await {
         return build_indexes(ds, on_phase).await;
     }
+    sweep_shuffle_leftovers(&std::env::temp_dir());
     on_phase("index deltas");
     if let Err(e) = optimize_indexes(ds).await {
         eprintln!("note: index update failed, rebuilding - {e:#}");

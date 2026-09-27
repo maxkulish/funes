@@ -114,25 +114,14 @@ explicit path or Hub repo is indexed in full.
 
 ## Keeping the indexes current
 
-Recall searches through two indexes over the memory: BM25 on the text and IVF_PQ on the vectors. A
-run that wrote nothing leaves them alone. A run that wrote rows adds them to each index as a
-**delta**, a small sub-index built with the model the index was trained with, so the per-turn hook
-pays for the rows it added, not for the whole memory. Once 8 deltas pile up, they are merged into
-one, and the base index is not read.
+A run that wrote rows adds them to the text (BM25) and vector (IVF_PQ) indexes as a **delta**, a
+sub-index built with the trained model, so its cost follows the rows added, not the memory. Every
+8 deltas are merged into one.
 
-A **full rebuild** retrains both indexes over every row, and it happens only when:
-
-- an index is missing: on the first index, and while the memory is too small to train the vector
-  index (lance needs about 256 rows);
-- the memory holds **twice the rows** the indexes were trained over. The vector index sizes its
-  partitions from the row count at training and a delta reuses them, so by then each partition holds
-  twice its target and a query reads twice the rows it should. Doubling keeps the rebuild work over a
-  memory's life within twice its final size;
-- a delta fails to build.
-
-On a memory of a million chunks a rebuild takes minutes, and it holds the memory lock the whole
-time. Rows not yet in an index are still found: recall scans them directly, next to the index, so
-an index that lags is only slower, never missing rows.
+Both indexes are **rebuilt** over every row only when one is missing (a first index, or a memory
+under ~256 rows), when the memory has **doubled** since they were trained (the vector index sizes
+its partitions at training), or when a delta fails. A rebuild of a million-chunk memory takes
+minutes. Rows not yet in an index are still recalled, by a scan beside the index.
 
 ## Tiers and ordering
 

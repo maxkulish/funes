@@ -70,8 +70,7 @@ validates a producer's output without writing anything, so run it before wiring 
 - **Local-first, always safe.** The index hook only ever writes your local memory; only the push hook
   touches the network — and with no memory bound, there's no push hook at all.
 - **Fresh every turn.** Each completed turn re-indexes; because indexing is incremental, the
-  re-sweep is cheap, and the search indexes take the new rows as a delta rather than a rebuild
-  ([when a rebuild happens](index.md#keeping-the-indexes-current)).
+  re-sweep is cheap, search indexes included ([how](index.md#keeping-the-indexes-current)).
 - **Published at the boundaries.** With a memory bound, an integration publishes at its agent's
   session end and again at the next session start, catching up anything a missed end left behind —
   a disconnect, a closed window. Which events those are for each agent is in its README.

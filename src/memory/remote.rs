@@ -51,7 +51,6 @@ use hf_hub::{HFError, HFRepository, RepoTypeDataset};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{Dataset, NewColumnTransform, WriteParams};
 use lance::index::DatasetIndexExt;
-use lance_index::optimize::OptimizeOptions;
 use lance_io::object_store::WrappingObjectStore;
 use object_store::ObjectStore as OSObjectStore;
 
@@ -183,17 +182,12 @@ pub(crate) async fn first_publish(
     Ok(Some(info.commit_oid.unwrap_or_else(|| "?".to_string())))
 }
 
-/// Fold an index's delta sub-indexes back into one once this many pile up. Queries fan out across
-/// every delta (and per-segment BM25 stats drift), so the pile must stay bounded. Only the deltas
-/// are merged — the base is never re-read, which would be the full-index rewrite [`reindex`]
-/// exists to avoid.
-const COMPACT_DELTAS: usize = 8;
-
 /// Refresh the remote dataset's indexes and land the delta in one `create_commit` on branch `rev`,
 /// guarded by the current head. The backlog is appended as a delta sub-index — merging it into the
-/// existing index would re-read the whole index over the network — until [`COMPACT_DELTAS`] pile
-/// up and the deltas are folded back into one. [`Reindexed::AlreadyCurrent`] if there was nothing
-/// to optimize, [`Reindexed::Conflict`] if the head moved first (retry against the new head).
+/// existing index would re-read the whole index over the network — until enough pile up that
+/// [`dataset::optimize_indexes`] folds the deltas back into one. [`Reindexed::AlreadyCurrent`] if
+/// there was nothing to optimize, [`Reindexed::Conflict`] if the head moved first (retry against
+/// the new head).
 pub(crate) async fn reindex(
     repo: &HFRepository<RepoTypeDataset>,
     dataset_uri: &str,
@@ -204,19 +198,9 @@ pub(crate) async fn reindex(
     let parent = head_oid(repo, rev).await?;
     let (mut ds, wrapper) = open_capturing(dataset_uri, storage_options).await?;
 
-    for (name, subs) in sub_index_counts(&ds).await? {
-        // subs = base + deltas; merge(deltas) folds every delta into one, sparing the base.
-        let deltas = subs - 1;
-        let opts = if deltas >= COMPACT_DELTAS {
-            eprintln!("  compacting {name} ({deltas} delta sub-indexes)…");
-            OptimizeOptions::merge(deltas)
-        } else {
-            OptimizeOptions::append()
-        };
-        ds.optimize_indices(&opts.index_names(vec![name]))
-            .await
-            .context("optimizing the remote index")?;
-    }
+    dataset::optimize_indexes(&mut ds)
+        .await
+        .context("optimizing the remote index")?;
 
     let files = captured_files(&wrapper);
     if files.is_empty() {
@@ -305,18 +289,6 @@ pub(crate) async fn max_unindexed_rows(ds: &Dataset) -> u64 {
         }
     }
     max
-}
-
-/// Sub-index count per index name (the base plus its deltas, which share the index's name), from
-/// the index metadata — not `index_statistics`, which can write a stats migration through the
-/// capture wrapper.
-async fn sub_index_counts(ds: &Dataset) -> Result<Vec<(String, usize)>> {
-    let indices = ds.load_indices().await.context("listing the remote indexes")?;
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for idx in indices.iter() {
-        *counts.entry(idx.name.clone()).or_default() += 1;
-    }
-    Ok(counts.into_iter().collect())
 }
 
 /// Read the commit at the tip of branch `rev` — the parent-commit guard for the next commit.
@@ -548,6 +520,8 @@ mod tests {
     use super::*;
     use arrow_array::StringArray;
     use arrow_schema::{DataType, Field, Schema};
+    use dataset::sub_index_counts;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::InvertedIndexParams;
     use lance_index::IndexType;
 

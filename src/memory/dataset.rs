@@ -1,9 +1,10 @@
 //! Shared memory helpers: the local memory location, the `chunks` table's schema and rows, opening a
-//! dataset, plain scans, and building the FTS/IVF indexes. funes's home is `$FUNES_HOME`/`~/.funes` —
-//! it holds the incremental state and the local memory at `…/memory` (the `chunks` Lance dataset).
+//! dataset, plain scans, and building and updating the FTS/IVF indexes. funes's home is
+//! `$FUNES_HOME`/`~/.funes` — it holds the incremental state and the local memory at `…/memory` (the
+//! `chunks` Lance dataset).
 
 use crate::chunk;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::Dataset;
 use lance::index::vector::VectorIndexParams;
 use lance::index::DatasetIndexExt;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
@@ -140,6 +142,102 @@ pub async fn build_indexes(ds: &mut Dataset, on_phase: impl Fn(&str)) {
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
             .await;
     }
+}
+
+/// Retrain the indexes once the memory holds this many times the rows they were trained over. IVF
+/// sizes its partitions from the row count at training and a delta reuses those centroids, so at
+/// this growth each partition holds twice its target and a query scans twice the rows it should.
+/// Doubling keeps the total rebuild work across a memory's life within twice its final size.
+const RETRAIN_GROWTH: usize = 2;
+
+/// Bring the FTS/IVF indexes up to date with the rows appended since they were built. With both in
+/// place, the new rows are folded in as delta sub-indexes ([`optimize_indexes`]), so the cost scales
+/// with the rows added rather than the memory. An index still missing (a first index, or a corpus
+/// too small to have trained IVF), a memory grown [`RETRAIN_GROWTH`] times past its indexes, or an
+/// append that fails gets the full [`build_indexes`].
+pub async fn refresh_indexes(ds: &mut Dataset, on_phase: impl Fn(&str)) {
+    if !has_every_index(ds).await || outgrew_indexes(ds).await {
+        return build_indexes(ds, on_phase).await;
+    }
+    on_phase("index deltas");
+    if let Err(e) = optimize_indexes(ds).await {
+        eprintln!("note: index update failed, rebuilding - {e:#}");
+        build_indexes(ds, on_phase).await;
+    }
+}
+
+/// Whether the dataset holds the FTS index on `text` and, where it can have one, the vector index.
+async fn has_every_index(ds: &Dataset) -> bool {
+    let Ok(indices) = ds.load_indices().await else {
+        return false;
+    };
+    let indexed = |col: &str| {
+        ds.schema()
+            .field(col)
+            .is_some_and(|f| indices.iter().any(|i| i.fields.first() == Some(&f.id)))
+    };
+    indexed("text") && (ivf_pq_params(ds).is_none() || indexed("vector"))
+}
+
+/// Whether the memory holds [`RETRAIN_GROWTH`] times the rows some index was trained over, counted
+/// from the largest segment of each index: its base, since merged deltas stay smaller until the
+/// corpus has doubled anyway.
+async fn outgrew_indexes(ds: &Dataset) -> bool {
+    let Ok(indices) = ds.load_indices().await else {
+        return false;
+    };
+    let rows = |covered: &dyn Fn(u64) -> bool| -> usize {
+        ds.fragments()
+            .iter()
+            .filter(|f| covered(f.id))
+            .map(|f| f.physical_rows.unwrap_or(0))
+            .sum()
+    };
+    let total = rows(&|_| true);
+    let mut trained: BTreeMap<&str, usize> = BTreeMap::new();
+    for idx in indices.iter() {
+        let Some(bitmap) = &idx.fragment_bitmap else { continue };
+        let covered = rows(&|id| bitmap.contains(id as u32));
+        let base = trained.entry(idx.name.as_str()).or_default();
+        *base = (*base).max(covered);
+    }
+    trained.values().any(|&base| total >= RETRAIN_GROWTH * base)
+}
+
+/// Fold an index's delta sub-indexes back into one once this many pile up. Queries fan out across
+/// every delta (and per-segment BM25 stats drift), so the pile must stay bounded. Only the deltas
+/// are merged; the base is never re-read.
+const COMPACT_DELTAS: usize = 8;
+
+/// Append the unindexed backlog to each index as a delta sub-index, reusing the trained model,
+/// until [`COMPACT_DELTAS`] pile up and the deltas are folded back into one.
+pub(crate) async fn optimize_indexes(ds: &mut Dataset) -> Result<()> {
+    for (name, subs) in sub_index_counts(ds).await? {
+        // subs = base + deltas; merge(deltas) folds every delta into one, sparing the base.
+        let deltas = subs - 1;
+        let opts = if deltas >= COMPACT_DELTAS {
+            eprintln!("  compacting {name} ({deltas} delta sub-indexes)…");
+            OptimizeOptions::merge(deltas)
+        } else {
+            OptimizeOptions::append()
+        };
+        ds.optimize_indices(&opts.index_names(vec![name.clone()]))
+            .await
+            .with_context(|| format!("optimizing {name}"))?;
+    }
+    Ok(())
+}
+
+/// Sub-index count per index name (the base plus its deltas, which share the index's name), from
+/// the index metadata - not `index_statistics`, which can write a stats migration through a
+/// capture wrapper.
+pub(crate) async fn sub_index_counts(ds: &Dataset) -> Result<Vec<(String, usize)>> {
+    let indices = ds.load_indices().await.context("listing the indexes")?;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for idx in indices.iter() {
+        *counts.entry(idx.name.clone()).or_default() += 1;
+    }
+    Ok(counts.into_iter().collect())
 }
 
 /// The files a lance IVF shuffle directory holds, and nothing else.
